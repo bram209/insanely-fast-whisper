@@ -10,6 +10,7 @@ from transformers import (
 from pyannote.audio import Pipeline
 from transformers.pipelines.audio_utils import ffmpeg_read
 from cog import BasePredictor, Input, Path
+import sys
 
 
 class Predictor(BasePredictor):
@@ -58,8 +59,8 @@ class Predictor(BasePredictor):
             description="Optional. Language spoken in the audio, specify None to perform language detection.",
         ),
         batch_size: int = Input(
-            default=24,
-            description="Number of parallel batches you want to compute. Reduce if you face OOMs. (default: 24).",
+            default=64,
+            description="Number of parallel batches you want to compute. Reduce if you face OOMs. (default: 64).",
         ),
         timestamp: str = Input(
             default="chunk",
@@ -218,9 +219,18 @@ def diarize_audio(diarizer_inputs, diarization_pipeline):
     return new_segments
 
 
-def post_process_segments_and_transcripts(new_segments, transcript, group_by_speaker):
+def post_process_segments_and_transcripts(
+    new_segments, transcript, group_by_speaker
+) -> list:
     # get the end timestamps for each chunk from the ASR output
-    end_timestamps = np.array([chunk["timestamp"][-1] for chunk in transcript])
+    end_timestamps = np.array(
+        [
+            chunk["timestamp"][-1]
+            if chunk["timestamp"][-1] is not None
+            else sys.float_info.max
+            for chunk in transcript
+        ]
+    )
     segmented_preds = []
 
     # align the diarizer timestamps and the ASR timestamps
@@ -250,5 +260,8 @@ def post_process_segments_and_transcripts(new_segments, transcript, group_by_spe
         # crop the transcripts and timestamp lists according to the latest timestamp (for faster argmin)
         transcript = transcript[upto_idx + 1 :]
         end_timestamps = end_timestamps[upto_idx + 1 :]
+
+        if len(end_timestamps) == 0:
+            break
 
     return segmented_preds

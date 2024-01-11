@@ -17,7 +17,7 @@ class Predictor(BasePredictor):
     def setup(self):
         """Loads whisper models into memory to make running multiple predictions efficient"""
         self.model_cache = "model_cache"
-        local_files_only = True  # set to true after the model is cached to model_cache
+        local_files_only = False  # set to true after the model is cached to model_cache
         model_id = "openai/whisper-large-v3"
         torch_dtype = torch.float16
         self.device = "cuda:0"
@@ -91,7 +91,7 @@ class Predictor(BasePredictor):
             return_timestamps="word" if timestamp == "word" else True,
         )
 
-        if diarize_audio:
+        if diarise_audio:
             if self.diarization_pipeline is None:
                 try:
                     self.diarization_pipeline = Pipeline.from_pretrained(
@@ -108,9 +108,13 @@ class Predictor(BasePredictor):
             if self.diarization_pipeline is not None:
                 print("Segmenting the audio clips.")
                 inputs, diarizer_inputs = preprocess_inputs(inputs=str(audio))
+                total_duration = inputs.shape[0] / 16000
                 segments = diarize_audio(diarizer_inputs, self.diarization_pipeline)
                 segmented_transcript = post_process_segments_and_transcripts(
-                    segments, outputs["chunks"], group_by_speaker=False
+                    segments,
+                    outputs["chunks"],
+                    group_by_speaker=False,
+                    total_duration=total_duration,
                 )
                 segmented_transcript.append(outputs)
                 print("Voila!✨ Your file has been transcribed & speaker segmented!")
@@ -121,6 +125,9 @@ class Predictor(BasePredictor):
 
 
 def preprocess_inputs(inputs):
+    import requests
+    import torchaudio.functional as F
+
     if isinstance(inputs, str):
         if inputs.startswith("http://") or inputs.startswith("https://"):
             # We need to actually check for a real protocol, otherwise it's impossible to use a local file
@@ -220,9 +227,12 @@ def diarize_audio(diarizer_inputs, diarization_pipeline):
 
 
 def post_process_segments_and_transcripts(
-    new_segments, transcript, group_by_speaker
+    new_segments, transcript, group_by_speaker, total_duration: float
 ) -> list:
     # get the end timestamps for each chunk from the ASR output
+    if transcript[-1]["timestamp"][-1] is None:
+        transcript[-1]["timestamp"] = (transcript[-1]["timestamp"][0], total_duration)
+
     end_timestamps = np.array(
         [
             chunk["timestamp"][-1]
@@ -237,31 +247,33 @@ def post_process_segments_and_transcripts(
     for segment in new_segments:
         # get the diarizer end timestamp
         end_time = segment["segment"]["end"]
-        # find the ASR end timestamp that is closest to the diarizer's end timestamp and cut the transcript to here
-        upto_idx = np.argmin(np.abs(end_timestamps - end_time))
 
-        if group_by_speaker:
-            segmented_preds.append(
-                {
-                    "speaker": segment["speaker"],
-                    "text": "".join(
-                        [chunk["text"] for chunk in transcript[: upto_idx + 1]]
-                    ),
-                    "timestamp": (
-                        transcript[0]["timestamp"][0],
-                        transcript[upto_idx]["timestamp"][1],
-                    ),
-                }
-            )
-        else:
-            for i in range(upto_idx + 1):
-                segmented_preds.append({"speaker": segment["speaker"], **transcript[i]})
+        # find the ASR end timestamp that is closest to the diarizer's end timestamp
+        # only if the ending timestamp is not None
+        if transcript and transcript[0]["timestamp"][-1] is not None:
+            upto_idx = np.argmin(np.abs(end_timestamps - end_time))
 
-        # crop the transcripts and timestamp lists according to the latest timestamp (for faster argmin)
-        transcript = transcript[upto_idx + 1 :]
-        end_timestamps = end_timestamps[upto_idx + 1 :]
+            if group_by_speaker:
+                segmented_preds.append(
+                    {
+                        "speaker": segment["speaker"],
+                        "text": "".join(
+                            [chunk["text"] for chunk in transcript[: upto_idx + 1]]
+                        ),
+                        "timestamp": (
+                            transcript[0]["timestamp"][0],
+                            transcript[upto_idx]["timestamp"][1],
+                        ),
+                    }
+                )
+            else:
+                for i in range(upto_idx + 1):
+                    segmented_preds.append(
+                        {"speaker": segment["speaker"], **transcript[i]}
+                    )
 
-        if len(end_timestamps) == 0:
-            break
+            # crop the transcripts and timestamp lists according to the latest timestamp (for faster argmin)
+            transcript = transcript[upto_idx + 1 :]
+            end_timestamps = end_timestamps[upto_idx + 1 :]
 
     return segmented_preds
